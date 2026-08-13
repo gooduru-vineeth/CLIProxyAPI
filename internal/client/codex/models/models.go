@@ -493,7 +493,7 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 		if contextWindow <= 0 && info.ContextLength > 0 {
 			contextWindow = info.ContextLength
 		}
-		if info.Type == registry.OpenAIImageModelType {
+		if info.Type == registry.OpenAIImageModelType || info.Type == registry.OpenAISpeechModelType {
 			entry["visibility"] = "hide"
 			delete(entry, "input_modalities")
 			delete(entry, "supports_image_detail_original")
@@ -570,7 +570,7 @@ func applyCodexClientVisibilityOverride(entry map[string]any, id string) {
 		target = strings.TrimSpace(target[idx+1:])
 	}
 	switch target {
-	case "grok-imagine-image-quality", "gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.5", "grok-imagine-image", "grok-imagine-image-2.0", "grok-imagine-video", "grok-imagine-video-1.5", "grok-imagine-video-1.5-preview":
+	case "grok-imagine-image-quality", "gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.5", "grok-imagine-image", "grok-imagine-image-2.0", "grok-imagine-video", "grok-imagine-video-1.5", "grok-imagine-video-1.5-preview", "grok-tts":
 		entry["visibility"] = "hide"
 	}
 }
