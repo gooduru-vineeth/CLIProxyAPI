@@ -29,6 +29,9 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if xaiIsVideoRequest(opts) {
 		return e.executeVideos(ctx, auth, req, opts)
 	}
+	if endpointPath := xaiSpeechEndpointPath(opts); endpointPath != "" {
+		return e.executeSpeech(ctx, auth, req, endpointPath)
+	}
 
 	token, _ := xaiCreds(auth)
 	baseURL := xaiChatBaseURL(auth)
