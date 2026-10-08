@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strings"
 
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -32,6 +31,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	payload := normalizeXAIImageRefs(req.Payload)
+	payload = helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, "openai", "", req.Payload, req, opts)(payload)
 	url := strings.TrimSuffix(baseURL, "/") + endpointPath
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
@@ -72,79 +72,6 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
-// executeSpeech forwards a text-to-speech request to the official xAI API.
-// The payload is already in xAI wire shape and carries no model field, so the
-// routing model is taken from req.Model. Responses are raw audio bytes (or JSON
-// when the caller asked for timestamps) and are returned untouched.
-func (e *XAIExecutor) executeSpeech(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, endpointPath string) (resp cliproxyexecutor.Response, err error) {
-	reporter := helps.NewExecutorUsageReporter(ctx, e, strings.TrimSpace(req.Model), auth)
-	defer reporter.TrackFailure(ctx, &err)
-
-	// Speech always uses the official API base and headers: an OAuth credential
-	// routed through the chat helpers would be pinned to the Grok CLI chat proxy,
-	// which has no /tts and would cool down the whole xAI auth pool on 404.
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
-	logXAIResolvedBaseURL(ctx, baseURL)
-	if endpointPath == "" {
-		endpointPath = xaiTTSPath
-	}
-
-	method := http.MethodPost
-	var body io.Reader = bytes.NewReader(req.Payload)
-	if endpointPath == xaiTTSVoicesPath {
-		method = http.MethodGet
-		body = nil
-	}
-
-	requestURL := strings.TrimSuffix(baseURL, "/") + endpointPath
-	httpReq, err := http.NewRequestWithContext(ctx, method, requestURL, body)
-	if err != nil {
-		return resp, err
-	}
-	applyXAIHeaders(httpReq, auth, token, false, "")
-	if endpointPath != xaiTTSVoicesPath {
-		// Synthesis returns binary audio, so the JSON Accept applied above would
-		// misrepresent what this request can handle.
-		httpReq.Header.Set("Accept", "*/*")
-	}
-	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Header.Clone(), req.Payload)
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("xai executor: close response body error: %v", errClose)
-		}
-	}()
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	contentType := httpResp.Header.Get("Content-Type")
-	// Successful speech responses are binary audio; keep the request log readable.
-	helps.AppendAPIResponseChunk(ctx, e.cfg, helps.ResponseLogBody(contentType, data))
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(contentType, data))
-		err = xaiStatusErr(httpResp.StatusCode, data)
-		return resp, err
-	}
-
-	reporter.EnsurePublished(ctx)
-	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
-}
-
 func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	model := strings.TrimSpace(gjson.GetBytes(req.Payload, "model").String())
 	if model == "" {
@@ -158,6 +85,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 	logXAIResolvedBaseURL(ctx, baseURL)
 
 	payload := normalizeXAIImageRefs(req.Payload)
+	payload = helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, "openai", "", req.Payload, req, opts)(payload)
 	method := http.MethodPost
 	endpointPath := xaiVideosGenerationsPath
 	var body io.Reader = bytes.NewReader(payload)

@@ -18,7 +18,8 @@ const (
 	xaiBuiltinVideoModelID             = "grok-imagine-video"
 	xaiBuiltinVideo15ModelID           = "grok-imagine-video-1.5"
 	xaiBuiltinVideo15PreviewID         = "grok-imagine-video-1.5-preview"
-	xaiBuiltinTTSModelID               = "grok-tts"
+	xaiBuiltinSpeechModelID            = "grok-tts"
+	xaiBuiltinSpeechVoiceModelID       = "grok-voice-tts-1.0"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -256,10 +257,10 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 	)
 }
 
-// WithXAIBuiltins injects hard-coded xAI image/video/speech model definitions that
-// should not depend on remote models.json updates.
+// WithXAIBuiltins injects hard-coded xAI image, video, and speech model definitions
+// that should not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinTTSModelInfo())
+	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinSpeechModelInfo(), xaiBuiltinSpeechVoiceModelInfo())
 }
 
 func normalizeAntigravityCapabilityModelID(modelID string) string {
@@ -408,22 +409,29 @@ func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
 	}
 }
 
-// xaiBuiltinTTSModelInfo describes the synthetic model id used to route speech
-// requests to the xAI provider. xAI's /v1/tts endpoint takes no model field, so
-// this id exists only for provider resolution and model catalog discovery; it is
-// never forwarded upstream.
-func xaiBuiltinTTSModelInfo() *ModelInfo {
+func xaiBuiltinSpeechModelInfo() *ModelInfo {
 	return &ModelInfo{
-		ID:                        xaiBuiltinTTSModelID,
-		Object:                    "model",
-		Created:                   1735689600, // 2025-01-01
-		OwnedBy:                   "xai",
-		Type:                      "xai",
-		DisplayName:               "Grok TTS",
-		Name:                      xaiBuiltinTTSModelID,
-		Description:               "xAI Grok text-to-speech model.",
-		SupportedInputModalities:  []string{"text"},
-		SupportedOutputModalities: []string{"audio"},
+		ID:          xaiBuiltinSpeechModelID,
+		Object:      "model",
+		Created:     1773619200, // 2026-03-16
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok TTS",
+		Name:        xaiBuiltinSpeechModelID,
+		Description: "xAI Grok unary text-to-speech model.",
+	}
+}
+
+func xaiBuiltinSpeechVoiceModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinSpeechVoiceModelID,
+		Object:      "model",
+		Created:     1773619200, // 2026-03-16
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Voice TTS 1.0",
+		Name:        xaiBuiltinSpeechVoiceModelID,
+		Description: "xAI Grok unary text-to-speech model.",
 	}
 }
 

@@ -1,228 +1,348 @@
 package executor
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
-func newXAISpeechAuth(baseURL string) *cliproxyauth.Auth {
-	return &cliproxyauth.Auth{
+func TestXAISpeechRequestURLStaysOnOfficialAPI(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+			"base_url":  xaiauth.CLIChatProxyBaseURL,
+		},
+	}
+	got := xaiSpeechRequestURL(auth)
+	want := strings.TrimSuffix(xaiauth.DefaultAPIBaseURL, "/") + xaiTTSPath
+	if got != want {
+		t.Fatalf("xaiSpeechRequestURL() = %q, want %q", got, want)
+	}
+	if xaiIsCLIChatProxyBaseURL(got) {
+		t.Fatalf("speech URL pinned to CLI chat proxy: %s", got)
+	}
+
+	custom := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "https://gateway.example/v1"}}
+	if got := xaiSpeechRequestURL(custom); got != "https://gateway.example/v1/tts" {
+		t.Fatalf("custom speech URL = %q", got)
+	}
+}
+
+func TestXAIExecutorExecuteSpeechPostsAudioRequest(t *testing.T) {
+	const body = `{"text":"hello","voice_id":"eve","language":"auto"}`
+	var gotPath string
+	var gotAuth string
+	var gotAccept string
+	var gotContentType string
+	var gotClientVersion string
+	var gotTokenAuth string
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotAccept = r.Header.Get("Accept")
+		gotContentType = r.Header.Get("Content-Type")
+		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
+		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
+		raw, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read body: %v", errRead)
+		}
+		gotBody = string(raw)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = w.Write([]byte("ID3audio"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
 		Provider: "xai",
 		Attributes: map[string]string{
-			"base_url":  baseURL,
+			"base_url":  server.URL + "/v1",
 			"auth_kind": "oauth",
 		},
 		Metadata: map[string]any{"access_token": "xai-token"},
 	}
-}
-
-func TestXAIExecutorExecuteSpeechUsesTTSEndpoint(t *testing.T) {
-	audio := []byte{0xFF, 0xFB, 0x90, 0x00, 0x01, 0x02}
-
-	var gotPath, gotMethod, gotAuth, gotTokenAuth, gotClientVersion, gotAccept string
-	var gotBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotMethod = r.Method
-		gotAuth = r.Header.Get("Authorization")
-		gotTokenAuth = r.Header.Get(xaiTokenAuthHeader)
-		gotClientVersion = r.Header.Get(xaiClientVersionHeader)
-		gotAccept = r.Header.Get("Accept")
-		var errRead error
-		gotBody, errRead = io.ReadAll(r.Body)
-		if errRead != nil {
-			t.Fatalf("read body: %v", errRead)
-		}
-		w.Header().Set("Content-Type", "audio/mpeg")
-		_, _ = w.Write(audio)
-	}))
-	defer server.Close()
-
-	exec := NewXAIExecutor(&config.Config{})
-	payload := []byte(`{"text":"hello","voice_id":"eve","language":"en"}`)
-
-	resp, err := exec.Execute(context.Background(), newXAISpeechAuth(server.URL), cliproxyexecutor.Request{
+	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "grok-tts",
-		Payload: payload,
+		Payload: []byte(body),
 	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-audio"),
-		Metadata: map[string]any{
-			cliproxyexecutor.RequestPathMetadataKey: "/v1/tts",
-		},
+		SourceFormat: sdktranslator.FromString("openai-speech"),
 	})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-
-	if gotPath != "/tts" {
-		t.Fatalf("path = %q, want /tts", gotPath)
-	}
-	if gotMethod != http.MethodPost {
-		t.Fatalf("method = %q, want POST", gotMethod)
+	if gotPath != "/v1/tts" {
+		t.Fatalf("path = %q, want /v1/tts", gotPath)
 	}
 	if gotAuth != "Bearer xai-token" {
-		t.Fatalf("Authorization = %q, want Bearer xai-token", gotAuth)
+		t.Fatalf("Authorization = %q", gotAuth)
 	}
-	// Speech must use the official API headers. The Grok CLI chat headers would
-	// mean the request went through the chat path, which has no /tts endpoint.
-	if gotTokenAuth != "" {
-		t.Fatalf("%s = %q, want empty on speech path", xaiTokenAuthHeader, gotTokenAuth)
-	}
-	if gotClientVersion != "" {
-		t.Fatalf("%s = %q, want empty on speech path", xaiClientVersionHeader, gotClientVersion)
-	}
-	// Synthesis returns binary audio, so a JSON-only Accept would misdescribe it.
 	if gotAccept != "*/*" {
 		t.Fatalf("Accept = %q, want */*", gotAccept)
 	}
-	if !bytes.Equal(gotBody, payload) {
-		t.Fatalf("body = %s, want %s", string(gotBody), string(payload))
+	if gotContentType != "application/json" {
+		t.Fatalf("Content-Type = %q", gotContentType)
 	}
-	if !bytes.Equal(resp.Payload, audio) {
-		t.Fatalf("payload = %v, want %v", resp.Payload, audio)
+	if gotClientVersion != "" || gotTokenAuth != "" {
+		t.Fatalf("chat-proxy headers leaked: version=%q token-auth=%q", gotClientVersion, gotTokenAuth)
 	}
-	if got := resp.Headers.Get("Content-Type"); got != "audio/mpeg" {
-		t.Fatalf("Content-Type = %q, want audio/mpeg", got)
+	if gotBody != body {
+		t.Fatalf("body = %s", gotBody)
+	}
+	if string(resp.Payload) != "ID3audio" {
+		t.Fatalf("payload = %q", resp.Payload)
+	}
+	if resp.Headers.Get("Content-Type") != "audio/mpeg" {
+		t.Fatalf("response Content-Type = %q", resp.Headers.Get("Content-Type"))
 	}
 }
 
-// TestXAIExecutorExecuteSpeechUsesOfficialAPIBaseForOAuth guards the trap where an
-// OAuth credential is routed through the chat helpers and pinned to the Grok CLI
-// chat proxy, which has no /tts and would cool down the whole xAI auth pool.
-func TestXAIExecutorExecuteSpeechUsesOfficialAPIBaseForOAuth(t *testing.T) {
-	var gotHost string
+func TestXAIExecutorExecuteStreamRejectsSpeech(t *testing.T) {
+	exec := NewXAIExecutor(&config.Config{})
+	_, err := exec.ExecuteStream(context.Background(), &cliproxyauth.Auth{}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString(xaiSpeechHandlerType),
+	})
+	if err == nil || !strings.Contains(err.Error(), "streaming not supported") {
+		t.Fatalf("error = %v", err)
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status error = %v", err)
+	}
+}
+
+func TestXAIExecutorExecuteSpeechPayloadRulesMatchOpenAIProtocol(t *testing.T) {
+	const body = `{"text":"hello","voice_id":"eve","language":"auto"}`
+	var gotBody string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHost = r.Host
+		raw, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read body: %v", errRead)
+		}
+		gotBody = string(raw)
 		w.Header().Set("Content-Type", "audio/mpeg")
-		_, _ = w.Write([]byte{0x00})
+		_, _ = w.Write([]byte("ID3audio"))
 	}))
 	defer server.Close()
 
-	exec := NewXAIExecutor(&config.Config{})
-	auth := newXAISpeechAuth(server.URL)
-
-	if _, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+		Models: []config.PayloadModelRule{{Name: "grok-tts", Protocol: "openai"}},
+		Params: map[string]any{"voice_id": "ara", "language": "en"},
+	}}}}
+	exec := NewXAIExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL + "/v1",
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "grok-tts",
-		Payload: []byte(`{"text":"hi","voice_id":"eve","language":"auto"}`),
+		Payload: []byte(body),
 	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-audio"),
-		Metadata: map[string]any{
-			cliproxyexecutor.RequestPathMetadataKey: "/v1/audio/speech",
-		},
-	}); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	if gotHost == "" {
-		t.Fatal("speech request did not reach the configured base URL")
-	}
-}
-
-func TestXAIExecutorExecuteSpeechVoicesUsesGet(t *testing.T) {
-	var gotPath, gotMethod string
-	var bodyLen int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotMethod = r.Method
-		body, _ := io.ReadAll(r.Body)
-		bodyLen = len(body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"voices":[{"voice_id":"eve"}]}`))
-	}))
-	defer server.Close()
-
-	exec := NewXAIExecutor(&config.Config{})
-	resp, err := exec.Execute(context.Background(), newXAISpeechAuth(server.URL), cliproxyexecutor.Request{
-		Model: "grok-tts",
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-audio"),
-		Metadata: map[string]any{
-			cliproxyexecutor.RequestPathMetadataKey: "/v1/tts/voices",
-		},
+		SourceFormat: sdktranslator.FromString(xaiSpeechHandlerType),
 	})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-
-	if gotPath != "/tts/voices" {
-		t.Fatalf("path = %q, want /tts/voices", gotPath)
+	if got := gjson.Get(gotBody, "voice_id").String(); got != "ara" {
+		t.Fatalf("voice_id = %q, want payload rule override ara; body=%s", got, gotBody)
 	}
-	if gotMethod != http.MethodGet {
-		t.Fatalf("method = %q, want GET", gotMethod)
+	if got := gjson.Get(gotBody, "language").String(); got != "en" {
+		t.Fatalf("language = %q, want payload rule override en; body=%s", got, gotBody)
 	}
-	if bodyLen != 0 {
-		t.Fatalf("voices request body length = %d, want 0", bodyLen)
-	}
-	if string(resp.Payload) != `{"voices":[{"voice_id":"eve"}]}` {
-		t.Fatalf("payload = %s", string(resp.Payload))
+	if got := gjson.Get(gotBody, "text").String(); got != "hello" {
+		t.Fatalf("text = %q, want hello; body=%s", got, gotBody)
 	}
 }
 
-func TestXAIExecutorExecuteSpeechSurfacesUpstreamError(t *testing.T) {
+func TestXAIExecutorExecuteSpeechUpstreamErrorScope(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		wantStatus int
+		wantScoped bool
+	}{
+		{name: "bad request", status: http.StatusBadRequest, body: `{"error":"invalid language"}`, wantStatus: http.StatusBadRequest},
+		{name: "bad request model unsupported", status: http.StatusBadRequest, body: `{"error":"requested model is not supported"}`, wantStatus: http.StatusBadRequest},
+		{name: "unknown voice not found", status: http.StatusNotFound, body: `{"error":"voice not found"}`, wantStatus: http.StatusNotFound, wantScoped: true},
+		{name: "model not found nested code", status: http.StatusNotFound, body: `{"error":{"code":"model_not_found","message":"The model grok-tts does not exist"}}`, wantStatus: http.StatusNotFound},
+		{name: "model not found flat code", status: http.StatusNotFound, body: `{"code":"model_not_found","error":"model unavailable"}`, wantStatus: http.StatusNotFound},
+		{name: "model not available", status: http.StatusNotFound, body: `{"error":"The model grok-tts is not available for your account"}`, wantStatus: http.StatusNotFound},
+		{name: "model not available plain text", status: http.StatusNotFound, body: `model is not available`, wantStatus: http.StatusNotFound},
+		{name: "model unsupported", status: http.StatusNotFound, body: `{"error":{"message":"Unsupported model: grok-tts"}}`, wantStatus: http.StatusNotFound},
+		{name: "unprocessable", status: http.StatusUnprocessableEntity, body: `{"error":"text too long"}`, wantStatus: http.StatusUnprocessableEntity},
+		{name: "unprocessable model unsupported", status: http.StatusUnprocessableEntity, body: `{"code":"model_not_supported","error":"model is not supported"}`, wantStatus: http.StatusUnprocessableEntity},
+		{name: "unauthorized", status: http.StatusUnauthorized, body: `{"error":"unauthorized"}`, wantStatus: http.StatusUnauthorized},
+		{name: "bad credentials remapped", status: http.StatusForbidden, body: `{"code":"bad-credentials","error":"access token could not be validated"}`, wantStatus: http.StatusUnauthorized},
+		{name: "forbidden", status: http.StatusForbidden, body: `{"error":"forbidden"}`, wantStatus: http.StatusForbidden},
+		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"error":"rate limited"}`, wantStatus: http.StatusTooManyRequests},
+		{name: "upstream failure", status: http.StatusInternalServerError, body: `{"error":"boom"}`, wantStatus: http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"base_url":  server.URL + "/v1",
+					"auth_kind": "oauth",
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			}
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "grok-tts",
+				Payload: []byte(`{"text":"hello","voice_id":"nope","language":"auto"}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FromString(xaiSpeechHandlerType),
+			})
+			if err == nil {
+				t.Fatal("Execute() error = nil, want upstream error")
+			}
+			status, ok := err.(interface{ StatusCode() int })
+			if !ok || status.StatusCode() != tt.wantStatus {
+				t.Fatalf("status error = %v (%T), want status %d", err, err, tt.wantStatus)
+			}
+			if err.Error() != tt.body {
+				t.Fatalf("error message = %q, want upstream body %q", err.Error(), tt.body)
+			}
+			if tt.wantScoped {
+				assertRequestScopedTestError(t, err)
+				if !isRequestScopedExecutorError(err) {
+					t.Fatalf("error %T is not recognized as cliproxyexecutor.RequestScopedError", err)
+				}
+				return
+			}
+			assertNotRequestScopedTestError(t, err)
+			if isRequestScopedExecutorError(err) {
+				t.Fatalf("error %T unexpectedly recognized as cliproxyexecutor.RequestScopedError", err)
+			}
+		})
+	}
+}
+
+func isRequestScopedExecutorError(err error) bool {
+	var requestErr cliproxyexecutor.RequestScopedError
+	return errors.As(err, &requestErr) && requestErr.IsRequestScoped()
+}
+
+func newXAISpeechScopeManager(t *testing.T, baseURL string, count int) (*cliproxyauth.Manager, []string) {
+	t.Helper()
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	manager.RegisterExecutor(NewXAIExecutor(&config.Config{}))
+
+	reg := registry.GetGlobalRegistry()
+	authIDs := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		auth := &cliproxyauth.Auth{
+			ID:       uuid.NewString() + "-xai-speech-scope",
+			Provider: "xai",
+			Attributes: map[string]string{
+				"base_url":  baseURL + "/v1",
+				"auth_kind": "oauth",
+			},
+			Metadata: map[string]any{"access_token": "xai-token-" + uuid.NewString()},
+		}
+		reg.RegisterClient(auth.ID, "xai", []*registry.ModelInfo{{ID: "grok-tts"}})
+		authID := auth.ID
+		t.Cleanup(func() { reg.UnregisterClient(authID) })
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+		authIDs = append(authIDs, auth.ID)
+	}
+	return manager, authIDs
+}
+
+func TestXAIExecutorSpeechUnknownVoiceDoesNotRotateOrCoolCredentials(t *testing.T) {
+	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"voice not found"}`))
 	}))
 	defer server.Close()
 
-	exec := NewXAIExecutor(&config.Config{})
-	_, err := exec.Execute(context.Background(), newXAISpeechAuth(server.URL), cliproxyexecutor.Request{
+	manager, authIDs := newXAISpeechScopeManager(t, server.URL, 2)
+	reg := registry.GetGlobalRegistry()
+
+	_, err := manager.Execute(context.Background(), []string{"xai"}, cliproxyexecutor.Request{
 		Model:   "grok-tts",
-		Payload: []byte(`{"text":"hi","voice_id":"eve","language":"auto"}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-audio"),
-		Metadata: map[string]any{
-			cliproxyexecutor.RequestPathMetadataKey: "/v1/tts",
-		},
-	})
+		Payload: []byte(`{"text":"hello","voice_id":"nope","language":"auto"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(xaiSpeechHandlerType)})
 	if err == nil {
-		t.Fatal("Execute() error = nil, want a 429 status error")
+		t.Fatal("Execute() error = nil, want upstream 404")
 	}
-	statusErrValue, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("error %T does not expose a status code", err)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts = %d, want 1 (no cross-credential retry)", got)
 	}
-	if statusErrValue.StatusCode() != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", statusErrValue.StatusCode())
+
+	now := time.Now()
+	for _, id := range authIDs {
+		updated, ok := manager.GetByID(id)
+		if !ok || updated == nil {
+			t.Fatalf("auth %s not found", id)
+		}
+		if updated.Unavailable || updated.NextRetryAfter.After(now) {
+			t.Fatalf("auth %s cooled down: unavailable=%v next_retry_after=%v", id, updated.Unavailable, updated.NextRetryAfter)
+		}
+		if state := updated.ModelStates["grok-tts"]; state != nil && (state.Unavailable || state.NextRetryAfter.After(now)) {
+			t.Fatalf("auth %s model grok-tts cooled down: %+v", id, state)
+		}
+		if reg.IsModelSuspendedForClient(id, "grok-tts") {
+			t.Fatalf("auth %s model grok-tts suspended in registry", id)
+		}
 	}
 }
 
-func TestXAISpeechEndpointPath(t *testing.T) {
-	cases := []struct {
-		name        string
-		sourceForma string
-		requestPath string
-		want        string
-	}{
-		{name: "audio speech", sourceForma: "openai-audio", requestPath: "/v1/audio/speech", want: xaiTTSPath},
-		{name: "native tts", sourceForma: "openai-audio", requestPath: "/v1/tts", want: xaiTTSPath},
-		{name: "voices", sourceForma: "openai-audio", requestPath: "/v1/tts/voices", want: xaiTTSVoicesPath},
-		{name: "missing path defaults to tts", sourceForma: "openai-audio", requestPath: "", want: xaiTTSPath},
-		{name: "image format ignored", sourceForma: "openai-image", requestPath: "/v1/tts", want: ""},
-		{name: "chat format ignored", sourceForma: "openai", requestPath: "/v1/tts", want: ""},
-	}
+func TestXAIExecutorSpeechModelNotFoundRotatesCredentials(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"model_not_found","message":"The model grok-tts does not exist"}}`))
+	}))
+	defer server.Close()
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			opts := cliproxyexecutor.Options{
-				SourceFormat: sdktranslator.FromString(tc.sourceForma),
-				Metadata: map[string]any{
-					cliproxyexecutor.RequestPathMetadataKey: tc.requestPath,
-				},
-			}
-			if got := xaiSpeechEndpointPath(opts); got != tc.want {
-				t.Fatalf("xaiSpeechEndpointPath() = %q, want %q", got, tc.want)
-			}
-		})
+	manager, _ := newXAISpeechScopeManager(t, server.URL, 2)
+
+	_, err := manager.Execute(context.Background(), []string{"xai"}, cliproxyexecutor.Request{
+		Model:   "grok-tts",
+		Payload: []byte(`{"text":"hello","voice_id":"eve","language":"auto"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(xaiSpeechHandlerType)})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want upstream 404")
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("upstream attempts = %d, want 2 (model_not_found keeps credential rotation)", got)
 	}
 }
