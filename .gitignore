@@ -20,6 +20,11 @@ pgstore/*
 gitstore/*
 objectstore/*
 
+# Local runtime data (never commit)
+/data/
+server-restart.log
+test-output
+
 # Static assets
 static/*
 
