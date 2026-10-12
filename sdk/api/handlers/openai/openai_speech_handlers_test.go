@@ -138,13 +138,50 @@ func TestSpeechRoutingModel(t *testing.T) {
 }
 
 func TestSpeechResponseContentType(t *testing.T) {
-	if got := speechResponseContentType("mp3", ""); got != "audio/mpeg" {
+	if got := speechResponseContentType("mp3", "", false); got != "audio/mpeg" {
 		t.Fatalf("empty upstream = %q", got)
 	}
-	if got := speechResponseContentType("wav", "application/json"); got != "audio/wav" {
+	if got := speechResponseContentType("wav", "application/json", false); got != "audio/wav" {
 		t.Fatalf("json upstream = %q", got)
 	}
-	if got := speechResponseContentType("pcm", "audio/L16; rate=24000"); got != "audio/L16; rate=24000" {
+	if got := speechResponseContentType("pcm", "audio/L16; rate=24000", false); got != "audio/L16; rate=24000" {
 		t.Fatalf("audio upstream = %q", got)
+	}
+}
+
+func TestSpeechResponseContentTypeTimestampsEnvelope(t *testing.T) {
+	if got := speechResponseContentType("wav", "", true); got != "application/json" {
+		t.Fatalf("empty upstream = %q", got)
+	}
+	if got := speechResponseContentType("wav", "application/json; charset=utf-8", true); got != "application/json" {
+		t.Fatalf("json upstream = %q", got)
+	}
+}
+
+func TestBuildXAISpeechPayloadForwardsTimestamps(t *testing.T) {
+	payload, format, err := buildXAISpeechPayload([]byte(`{"text":"hello","voice_id":"eve","output_format":{"codec":"wav","sample_rate":24000},"with_timestamps":true}`))
+	if err != nil {
+		t.Fatalf("buildXAISpeechPayload() error = %v", err)
+	}
+	if format != "wav" {
+		t.Fatalf("format = %q, want wav", format)
+	}
+	if got := gjson.GetBytes(payload, "with_timestamps"); got.Type != gjson.True {
+		t.Fatalf("with_timestamps = %s", payload)
+	}
+
+	for _, body := range []string{
+		`{"text":"hello"}`,
+		`{"text":"hello","with_timestamps":false}`,
+		`{"text":"hello","with_timestamps":"true"}`,
+		`{"text":"hello","with_timestamps":1}`,
+	} {
+		payload, _, err = buildXAISpeechPayload([]byte(body))
+		if err != nil {
+			t.Fatalf("buildXAISpeechPayload(%s) error = %v", body, err)
+		}
+		if gjson.GetBytes(payload, "with_timestamps").Exists() {
+			t.Fatalf("with_timestamps should be omitted for %s: %s", body, payload)
+		}
 	}
 }

@@ -14,12 +14,17 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/tidwall/gjson"
 )
+
+const speechTimestampsEnvelope = `{"audio":"UklGRg==","audio_timestamps":{"graph_chars":["h","i"],"graph_times":[[0,0.1],[0.1,0.2]]}}`
 
 type speechCaptureExecutor struct {
 	mu      sync.Mutex
 	models  []string
 	sources []string
+	// ignoreTimestamps answers a with_timestamps request with raw audio.
+	ignoreTimestamps bool
 }
 
 func (e *speechCaptureExecutor) Identifier() string { return "xai" }
@@ -29,6 +34,9 @@ func (e *speechCaptureExecutor) Execute(_ context.Context, _ *coreauth.Auth, req
 	e.models = append(e.models, req.Model)
 	e.sources = append(e.sources, opts.SourceFormat.String())
 	e.mu.Unlock()
+	if gjson.GetBytes(req.Payload, "with_timestamps").Bool() && !e.ignoreTimestamps {
+		return coreexecutor.Response{Payload: []byte(speechTimestampsEnvelope), Headers: http.Header{"Content-Type": []string{"application/json"}}}, nil
+	}
 	return coreexecutor.Response{Payload: []byte("ID3audio"), Headers: http.Header{"Content-Type": []string{"audio/mpeg"}}}, nil
 }
 
@@ -126,6 +134,51 @@ func TestSpeechEndpointsRouteSpeechOnlyModelsToExecutor(t *testing.T) {
 				t.Fatalf("executor source format = %q, want %q", got, xaiSpeechHandlerType)
 			}
 		})
+	}
+}
+
+func TestSpeechEndpointsReturnTimestampsEnvelope(t *testing.T) {
+	executor := &speechCaptureExecutor{}
+	handler, _ := newSpeechRoutingTestHandlers(t, executor)
+
+	cases := []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+		body    string
+	}{
+		{name: "native tts", path: "/v1/tts", handler: handler.XAITTS, body: `{"model":"grok-tts","text":"hi","voice_id":"eve","output_format":{"codec":"wav","sample_rate":24000},"with_timestamps":true}`},
+		{name: "audio speech", path: "/v1/audio/speech", handler: handler.AudioSpeech, body: `{"model":"tts-1","input":"hi","response_format":"wav","with_timestamps":true}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := performSpeechRoutingRequest(t, tc.path, tc.body, tc.handler)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+			}
+			if got := resp.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+			if resp.Body.String() != speechTimestampsEnvelope {
+				t.Fatalf("body = %q", resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestSpeechEndpointsKeepAudioWhenUpstreamIgnoresTimestamps(t *testing.T) {
+	executor := &speechCaptureExecutor{ignoreTimestamps: true}
+	handler, _ := newSpeechRoutingTestHandlers(t, executor)
+
+	resp := performSpeechRoutingRequest(t, "/v1/tts", `{"text":"hi","output_format":{"codec":"wav","sample_rate":24000},"with_timestamps":true}`, handler.XAITTS)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := resp.Header().Get("Content-Type"); got != "audio/wav" {
+		t.Fatalf("Content-Type = %q, want audio/wav", got)
+	}
+	if resp.Body.String() != "ID3audio" {
+		t.Fatalf("body = %q", resp.Body.String())
 	}
 }
 

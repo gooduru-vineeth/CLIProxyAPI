@@ -85,7 +85,10 @@ func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Type", speechResponseContentType(format, upstreamHeaders.Get("Content-Type")))
+	// Upstream headers are only visible with passthrough-headers, so the envelope is
+	// recognised by its body. An upstream that ignores with_timestamps sends raw audio.
+	timestampsEnvelope := gjson.GetBytes(payload, "with_timestamps").Bool() && gjson.ValidBytes(resp)
+	c.Header("Content-Type", speechResponseContentType(format, upstreamHeaders.Get("Content-Type"), timestampsEnvelope))
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	c.Writer.Header().Del("Content-Length")
 	_, _ = c.Writer.Write(resp)
@@ -157,6 +160,11 @@ func buildXAISpeechPayload(raw []byte) ([]byte, string, error) {
 	}
 	if speed := gjson.GetBytes(raw, "speed"); speed.Exists() && speed.Type == gjson.Number && speed.Float() > 0 {
 		body["speed"] = speed.Float()
+	}
+	// with_timestamps switches the upstream reply from raw audio to a JSON envelope
+	// holding base64 audio and per-character timings.
+	if gjson.GetBytes(raw, "with_timestamps").Type == gjson.True {
+		body["with_timestamps"] = true
 	}
 	format, output, err := speechOutputFormat(raw)
 	if err != nil {
@@ -242,7 +250,11 @@ func speechContentTypeNeedsDefault(contentType string) bool {
 	}
 }
 
-func speechResponseContentType(format, upstream string) string {
+func speechResponseContentType(format, upstream string, timestampsEnvelope bool) string {
+	// A timestamps reply is a JSON envelope, so it must not be labelled as audio.
+	if timestampsEnvelope {
+		return "application/json"
+	}
 	if !speechContentTypeNeedsDefault(upstream) {
 		return upstream
 	}
