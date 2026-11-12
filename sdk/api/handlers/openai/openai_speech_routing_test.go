@@ -8,13 +8,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	apihandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 const speechTimestampsEnvelope = `{"audio":"UklGRg==","audio_timestamps":{"graph_chars":["h","i"],"graph_times":[[0,0.1],[0.1,0.2]]}}`
@@ -34,7 +34,7 @@ func (e *speechCaptureExecutor) Execute(_ context.Context, _ *coreauth.Auth, req
 	e.models = append(e.models, req.Model)
 	e.sources = append(e.sources, opts.SourceFormat.String())
 	e.mu.Unlock()
-	if gjson.GetBytes(req.Payload, "with_timestamps").Bool() && !e.ignoreTimestamps {
+	if ojson.GetBytesNoCopy(req.Payload, "with_timestamps").Bool() && !e.ignoreTimestamps {
 		return coreexecutor.Response{Payload: []byte(speechTimestampsEnvelope), Headers: http.Header{"Content-Type": []string{"application/json"}}}, nil
 	}
 	return coreexecutor.Response{Payload: []byte("ID3audio"), Headers: http.Header{"Content-Type": []string{"audio/mpeg"}}}, nil

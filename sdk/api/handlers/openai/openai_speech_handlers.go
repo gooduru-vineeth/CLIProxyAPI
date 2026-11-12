@@ -9,10 +9,10 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -60,7 +60,7 @@ func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
 		return
 	}
 
-	requested := strings.TrimSpace(gjson.GetBytes(raw, "model").String())
+	requested := strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(raw, "model").String()))
 	model, ok := speechRoutingModel(requested)
 	if !ok {
 		writeSpeechError(c, http.StatusBadRequest, fmt.Sprintf("Model %s is not supported on /v1/audio/speech. Use %s.", requested, defaultXAISpeechModel))
@@ -87,7 +87,7 @@ func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
 
 	// Upstream headers are only visible with passthrough-headers, so the envelope is
 	// recognised by its body. An upstream that ignores with_timestamps sends raw audio.
-	timestampsEnvelope := gjson.GetBytes(payload, "with_timestamps").Bool() && gjson.ValidBytes(resp)
+	timestampsEnvelope := ojson.GetBytesNoCopy(payload, "with_timestamps").Bool() && ojson.ValidBytes(resp)
 	c.Header("Content-Type", speechResponseContentType(format, upstreamHeaders.Get("Content-Type"), timestampsEnvelope))
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	c.Writer.Header().Del("Content-Length")
@@ -131,12 +131,14 @@ func speechModelBase(model string) string {
 }
 
 func buildXAISpeechPayload(raw []byte) ([]byte, string, error) {
-	if !gjson.ValidBytes(raw) {
+	if !ojson.ValidBytes(raw) {
 		return nil, "", errors.New("body must be valid JSON")
 	}
-	text := strings.TrimSpace(gjson.GetBytes(raw, "input").String())
+	var fieldsBuf [7]ojson.Result
+	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], raw, "input", "text", "voice", "voice_id", "language", "speed", "with_timestamps")
+	text := strings.TrimSpace(fields[0].String())
 	if text == "" {
-		text = strings.TrimSpace(gjson.GetBytes(raw, "text").String())
+		text = strings.TrimSpace(fields[1].String())
 	}
 	if text == "" {
 		return nil, "", errors.New("input is required")
@@ -145,11 +147,11 @@ func buildXAISpeechPayload(raw []byte) ([]byte, string, error) {
 		return nil, "", errors.New("input is longer than 60000 characters")
 	}
 
-	voice := strings.TrimSpace(gjson.GetBytes(raw, "voice").String())
+	voice := strings.TrimSpace(fields[2].String())
 	if voice == "" {
-		voice = gjson.GetBytes(raw, "voice_id").String()
+		voice = fields[3].String()
 	}
-	language := strings.TrimSpace(gjson.GetBytes(raw, "language").String())
+	language := strings.TrimSpace(fields[4].String())
 	if language == "" {
 		language = "auto"
 	}
@@ -158,12 +160,12 @@ func buildXAISpeechPayload(raw []byte) ([]byte, string, error) {
 		"voice_id": mapXAISpeechVoice(voice),
 		"language": language,
 	}
-	if speed := gjson.GetBytes(raw, "speed"); speed.Exists() && speed.Type == gjson.Number && speed.Float() > 0 {
+	if speed := fields[5]; speed.Exists() && speed.Type == ojson.Number && speed.Float() > 0 {
 		body["speed"] = speed.Float()
 	}
 	// with_timestamps switches the upstream reply from raw audio to a JSON envelope
 	// holding base64 audio and per-character timings.
-	if gjson.GetBytes(raw, "with_timestamps").Type == gjson.True {
+	if fields[6].Type == ojson.True {
 		body["with_timestamps"] = true
 	}
 	format, output, err := speechOutputFormat(raw)
@@ -188,16 +190,18 @@ func mapXAISpeechVoice(voice string) string {
 	if mapped, ok := openAISpeechVoices[voice]; ok {
 		return mapped
 	}
-	return voice
+	return strings.Clone(voice)
 }
 
 func speechOutputFormat(raw []byte) (string, map[string]any, error) {
-	responseFormat := strings.ToLower(strings.TrimSpace(gjson.GetBytes(raw, "response_format").String()))
+	var fieldsBuf [2]ojson.Result
+	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], raw, "response_format", "output_format")
+	responseFormat := strings.ToLower(strings.TrimSpace(fields[0].String()))
 	if responseFormat != "" {
 		format, output, err := speechCodecFormat(responseFormat, defaultXAISpeechSampleRate)
 		return format, output, err
 	}
-	native := gjson.GetBytes(raw, "output_format")
+	native := fields[1]
 	if !native.Exists() {
 		return "mp3", nil, nil
 	}
@@ -206,7 +210,7 @@ func speechOutputFormat(raw []byte) (string, map[string]any, error) {
 	}
 	codec := strings.ToLower(strings.TrimSpace(native.Get("codec").String()))
 	sampleRate := defaultXAISpeechSampleRate
-	if rate := native.Get("sample_rate"); rate.Exists() && rate.Type == gjson.Number && rate.Float() > 0 {
+	if rate := native.Get("sample_rate"); rate.Exists() && rate.Type == ojson.Number && rate.Float() > 0 {
 		sampleRate = int(rate.Float())
 	}
 	return speechCodecFormat(codec, sampleRate)
@@ -216,11 +220,16 @@ func speechCodecFormat(codec string, sampleRate int) (string, map[string]any, er
 	switch codec {
 	case "", "mp3":
 		return "mp3", nil, nil
-	case "wav", "pcm":
+	case "wav":
 		if sampleRate <= 0 {
 			sampleRate = defaultXAISpeechSampleRate
 		}
-		return codec, map[string]any{"codec": codec, "sample_rate": sampleRate}, nil
+		return "wav", map[string]any{"codec": "wav", "sample_rate": sampleRate}, nil
+	case "pcm":
+		if sampleRate <= 0 {
+			sampleRate = defaultXAISpeechSampleRate
+		}
+		return "pcm", map[string]any{"codec": "pcm", "sample_rate": sampleRate}, nil
 	default:
 		return "", nil, errors.New("response_format must be mp3, wav, or pcm")
 	}
